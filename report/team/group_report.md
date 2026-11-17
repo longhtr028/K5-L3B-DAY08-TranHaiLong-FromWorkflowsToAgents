@@ -2,7 +2,7 @@
 
 ## 1. Thông tin nhóm
 
-- Tên nhóm: TranHaiLong (L3A)
+- Tên nhóm: TranHaiLong (L3B)
 - Thành viên: Trần Hải Long — 2A20263891
 - Commit chốt dùng để chấm: `6ff4325` (trùng [ADR](decision_adr.md))
 

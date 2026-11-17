@@ -3,9 +3,9 @@
 ## Thông tin nhóm
 
 - Tên nhóm: TranHaiLong (nhóm một người)
-- Lớp: L3A
-- Repo nhóm: `K5-L3A-DAY08-TranHaiLong-FromWorkflowsToAgents`
-- URL repo: [longhtr028/K5-L3A-DAY08-TranHaiLong-FromWorkflowsToAgents](https://github.com/longhtr028/K5-L3A-DAY08-TranHaiLong-FromWorkflowsToAgents)
+- Lớp: L3B
+- Repo nhóm: `K5-L3B-DAY08-TranHaiLong-FromWorkflowsToAgents`
+- URL repo: [longhtr028/K5-L3B-DAY08-TranHaiLong-FromWorkflowsToAgents](https://github.com/longhtr028/K5-L3B-DAY08-TranHaiLong-FromWorkflowsToAgents)
 - Nhánh nộp: `main`; commit chốt dùng để chấm: `6ff4325`
 
 ## Thành viên
