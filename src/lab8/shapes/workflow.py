@@ -1,36 +1,88 @@
-"""Shape A — deterministic workflow. Student work.
-
-Signature (do not change):
-
-    run_claim(claim_id, *, seed, store_path, crash_at=None) -> RunResult
-
-Suggested steps. Money stays in code (`lab8.tools.compute_compensation`).
-
-1. Open the store. Read the claim through `get_claim_view` (not SELECT *).
-2. Missing order_id -> status `needs_info`. Do not write the ledger.
-3. `lookup_order`. If not visible -> `escalated`. Do not copy phone, address, item, internal note.
-4. Quote from the order row. Ignore delay numbers written in the ticket.
-5. Quote amount 0 -> `denied`. Do not call issue_refund.
-6. Quote amount > 0 -> `durability.issue_refund(conn, claim_id, <full quote>)`.
-   Pass the FULL quote. The host checks the claim's own approval and subtracts
-   what earlier claims already got for the same order (T13, T14). Do not
-   subtract it yourself or the host subtracts twice.
-   Auth failure or order already refunded -> `denied` (the host writes `policy_denied`).
-   `proposal_amount` stays the full quote. Amount conflict -> `failed`.
-7. Success -> `resolved`. One ledger row, one `refund_committed` audit.
-8. Use MockLLM only to draft the reply text, if you want a model call at all.
-
-The model must not choose the refund amount and must not commit the refund.
-
-Trace contract v1 (docs/contracts.md): return a trace_path to a JSON file written in this run,
-{"run_id": <same run_id>, "events": [...]}, on every return path including early
-ones. `lab8.trace.Trace` does this; your own tracer is fine if it matches.
-"""
+"""Shape A: fixed reads, a deterministic quote, and a host-controlled refund."""
 
 from __future__ import annotations
 
-from lab8.schemas import RunResult
-from lab8.shapes.common import not_implemented
+import sqlite3
+from contextlib import closing
+from typing import Any
+
+from lab8 import durability
+from lab8.db import connect
+from lab8.runtime import dispatch
+from lab8.schemas import Budget, RunResult, make_run_id
+from lab8.shapes.common import finish
+from lab8.tools import tool_cost
+from lab8.trace import Trace
+
+
+class ClaimRun:
+    """Shared result and refund handling; each shape gathers order evidence."""
+
+    def __init__(self, conn: sqlite3.Connection, shape: str, claim_id: str, seed: int):
+        self.conn = conn
+        self.shape = shape
+        self.claim_id = claim_id
+        self.seed = seed
+        self.budget = Budget()
+        self.trace = Trace(make_run_id(shape, claim_id, seed))
+        self.claim = dispatch(conn, self.budget, "get_claim_view", {"claim_id": claim_id}, worker=True)
+        self.trace.add("claim_read", {"found": self.claim["found"], "has_order": bool(self.claim.get("order_id"))})
+
+    def early_result(self) -> RunResult | None:
+        if not self.claim["found"]:
+            return self.finish("failed", "unknown_claim")
+        if not self.claim.get("order_id"):
+            return self.finish("needs_info", "missing_order_id")
+        return None
+
+    def order_args(self) -> dict[str, str]:
+        # The caller has already checked that the claim has an order.
+        return {key: self.claim[key] for key in ("order_id", "principal_id")}
+
+    def finish(self, status: str, reason: str | None = None, proposal: int = 0) -> RunResult:
+        self.trace.add("decision", {"status": status, "reason": reason})
+        return finish(
+            self.conn,
+            shape=self.shape,
+            claim_id=self.claim_id,
+            seed=self.seed,
+            status=status,
+            proposal_amount=proposal,
+            budget=self.budget,
+            trace=self.trace,
+            error_reason=reason,
+        )
+
+    def settle(self, order_view: dict[str, Any], *, crash_at: str | None) -> RunResult:
+        self.trace.add("order_scope", {"visible": order_view["visible"], "reason": order_view["reason"]})
+        if not order_view["visible"]:
+            return self.finish("escalated", order_view["reason"])
+
+        quote = dispatch(
+            self.conn, self.budget, "compute_compensation", {"order": order_view["order"]}, worker=True
+        )
+        proposal = quote["amount_vnd"]
+        quote_reason = quote["reason"]
+        if quote_reason.startswith("order_status_"):
+            # The quote helper embeds the raw order status in this reason.
+            quote_reason = "ineligible_order_status"
+        self.trace.add("quote", {"amount_vnd": proposal, "reason": quote_reason})
+        if proposal <= 0:
+            return self.finish("denied", quote_reason)
+
+        # The host subtracts prior refunds for the order. Send the full quote.
+        self.budget.add_tool(tool_cost())
+        outcome = durability.issue_refund(self.conn, self.claim_id, proposal, crash_at=crash_at)
+        reason = outcome["reason"]
+        if reason.startswith("approval_") and reason not in {
+            "approval_claim_mismatch", "approval_expired", "approval_revoked", "approval_pending",
+        }:
+            # Nonstandard approval states are arbitrary strings in the store.
+            reason = "invalid_approval_status"
+        self.trace.add("host_refund", {"ok": outcome["ok"], "reason": reason})
+        if outcome["ok"]:
+            return self.finish("resolved", proposal=proposal)
+        return self.finish("failed" if outcome["conflict"] else "denied", reason, proposal)
 
 
 def run_claim(
@@ -40,7 +92,9 @@ def run_claim(
     store_path: str,
     crash_at: str | None = None,
 ) -> RunResult:
-    # TODO CP2 (student): thay stub này bằng shape workflow theo các bước ở docstring đầu file.
-    # TODO CP3 (student): truyền crash_at vào durability.issue_refund, không bắt InjectedCrash.
-    del store_path, crash_at
-    return not_implemented("workflow", claim_id, seed)
+    with closing(connect(store_path)) as conn:
+        run = ClaimRun(conn, "workflow", claim_id, seed)
+        if early := run.early_result():
+            return early
+        order_view = dispatch(conn, run.budget, "lookup_order", run.order_args(), worker=True)
+        return run.settle(order_view, crash_at=crash_at)

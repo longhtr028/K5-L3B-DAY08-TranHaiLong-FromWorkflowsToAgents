@@ -1,27 +1,15 @@
-"""Shape B — one ReAct agent. Student work.
-
-Use `lab8.runtime.run_react` with max_steps=8. `decide` may pick a read tool.
-It must not call `issue_refund`. After the loop, the host validates the quote
-and is the only writer.
-
-A decide() that trusts ticket text over the order row will fail hidden claims
-where the customer overstates the delay or cites a superseded clause.
-
-Per-order cap: an order may already have been refunded by an earlier claim.
-The read tool `lookup_refund_history` shows how much. The host still enforces
-the cap, so pass the full quote to `durability.issue_refund`, not a net amount.
-
-Caps: stop at 8 steps. Count model calls in the Budget so cost stays comparable.
-
-Trace contract v1 (docs/contracts.md): return a trace_path to a JSON file written in this run,
-{"run_id": <same run_id>, "events": [...]}, on every return path including early
-ones. `lab8.trace.Trace` does this; your own tracer is fine if it matches.
-"""
+"""Shape B: a bounded ReAct loop with read tools and host-owned settlement."""
 
 from __future__ import annotations
 
+from contextlib import closing
+from typing import Any
+
+from lab8.db import connect
+from lab8.mock_llm import complete
+from lab8.runtime import run_react
 from lab8.schemas import RunResult
-from lab8.shapes.common import not_implemented
+from lab8.shapes.workflow import ClaimRun
 
 
 def run_claim(
@@ -31,7 +19,41 @@ def run_claim(
     store_path: str,
     crash_at: str | None = None,
 ) -> RunResult:
-    # TODO CP2 (student): thay stub này bằng shape single theo các bước ở docstring đầu file.
-    # TODO CP3 (student): truyền crash_at vào durability.issue_refund, không bắt InjectedCrash.
-    del store_path, crash_at
-    return not_implemented("single", claim_id, seed)
+    with closing(connect(store_path)) as conn:
+        run = ClaimRun(conn, "single", claim_id, seed)
+        if early := run.early_result():
+            return early
+
+        # The agent sees observations for these reads only. The claim fixes
+        # the order lookup arguments before the model picks an action.
+        pending = ["lookup_order", "lookup_policy"]
+        order_view = None
+
+        def decide(observation: dict[str, Any]) -> dict[str, Any]:
+            nonlocal order_view
+            last_tool = observation.get("last_tool")
+            if last_tool == "lookup_order":
+                order_view = observation["last_result"]
+                run.trace.add("read", {"tool": last_tool, "visible": order_view["visible"]})
+            elif last_tool == "lookup_policy":
+                run.trace.add("read", {"tool": last_tool, "policy_count": len(observation["last_result"]["policies"])})
+
+            if not pending or (order_view is not None and not order_view["visible"]):
+                return {"final": {}}
+
+            choice = 0
+            if len(pending) > 1:
+                # MockLLM returns a seeded digest instead of a tool-call object.
+                # Use one bit of the digest to select from the finite action set.
+                reply = complete(run.budget, seed=seed, purpose="choose_read", prompt=", ".join(pending))
+                choice = int(reply.endswith(("1", "3", "5", "7", "9", "b", "d", "f")))
+            name = pending.pop(choice)
+            run.trace.add("action", {"tool": name})
+            return {"tool": name, "args": run.order_args() if name == "lookup_order" else {}}
+
+        outcome = run_react(conn, run.budget, observation={}, decide=decide, max_steps=8, worker=True)
+        if outcome["stopped"] == "step_cap":
+            return run.finish("failed", "step_cap")
+        if order_view is None:
+            return run.finish("failed", "missing_order_evidence")
+        return run.settle(order_view, crash_at=crash_at)

@@ -1,25 +1,14 @@
-"""Shape C — orchestrator plus read-only investigators. Student work.
-
-1. Build a handoff with `lab8.handoff.make_handoff`. Allowed tools are read-only.
-   Never put parent_secret, raw headers, or the full claim row into facts.
-2. `lab8.runtime.run_readonly_investigators` runs those tools.
-3. The orchestrator quotes from the investigator's order view and calls
-   `durability.issue_refund`. Investigators have no write registry.
-   Pass the full quote; the host subtracts earlier refunds on the same order.
-   `lookup_refund_history` is a read-only tool you may hand to an investigator.
-4. Trace the sanitized handoff, not the parent context.
-
-An LLM summary of the parent context is not a sanitizer. Use the allowlist.
-
-Trace contract v1 (docs/contracts.md): return a trace_path to a JSON file written in this run,
-{"run_id": <same run_id>, "events": [...]}, on every return path including early
-ones. `lab8.trace.Trace` does this; your own tracer is fine if it matches.
-"""
+"""Shape C: delegate scoped reads using a typed handoff, then settle in code."""
 
 from __future__ import annotations
 
+from contextlib import closing
+
+from lab8.db import connect
+from lab8.handoff import make_handoff
+from lab8.runtime import run_readonly_investigators
 from lab8.schemas import RunResult
-from lab8.shapes.common import not_implemented
+from lab8.shapes.workflow import ClaimRun
 
 
 def run_claim(
@@ -29,7 +18,21 @@ def run_claim(
     store_path: str,
     crash_at: str | None = None,
 ) -> RunResult:
-    # TODO CP2 (student): thay stub này bằng shape orchestrator theo các bước ở docstring đầu file.
-    # TODO CP3 (student): truyền crash_at vào durability.issue_refund, không bắt InjectedCrash.
-    del store_path, crash_at
-    return not_implemented("orchestrator", claim_id, seed)
+    with closing(connect(store_path)) as conn:
+        run = ClaimRun(conn, "orchestrator", claim_id, seed)
+        if early := run.early_result():
+            return early
+
+        handoff = make_handoff(
+            request_id=f"REQ-{claim_id}",
+            claim_id=claim_id,
+            task="gather_refund_evidence",
+            facts={},
+            allowed_tools=["lookup_order", "lookup_policy"],
+        )
+        run.trace.add("handoff", handoff)
+        investigated = run_readonly_investigators(
+            conn, run.budget, handoff, principal_id=run.claim["principal_id"]
+        )["tools"]
+        run.trace.add("investigation", {"policy_count": len(investigated["lookup_policy"]["policies"])})
+        return run.settle(investigated["lookup_order"], crash_at=crash_at)
